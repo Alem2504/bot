@@ -6,6 +6,7 @@ from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, fil
 import nest_asyncio
 import re
 from telegram.error import RetryAfter
+import sqlite3
 
 # Apply nest_asyncio to allow nested async calls
 nest_asyncio.apply()
@@ -14,7 +15,7 @@ nest_asyncio.apply()
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s', level=logging.INFO)
 
 # Set your OpenAI API key
-openai.api_key = "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"
+
 
 # Initialize a list to track user negativity scores and a list to hold messages for score calculation
 user_scores = {}
@@ -23,6 +24,86 @@ message_count = 0  # Count of processed messages
 
 # Replace with your actual group chat ID
 GROUP_CHAT_ID = -1002329036187  # Replace with your group's chat ID
+
+
+def init_db():
+    conn = sqlite3.connect('user_scores.db')  # Connect to the database (creates it if it doesn't exist)
+    cursor = conn.cursor()
+
+    # Create a table to store user scores if it doesn't already exist
+    cursor.execute('''
+    CREATE TABLE IF NOT EXISTS user_scores (
+        user_id INTEGER PRIMARY KEY,
+        score REAL NOT NULL
+    )
+    ''')
+
+    conn.commit()  # Save changes
+    conn.close()
+
+
+# Function to insert or update a user's score
+def update_user_score(user_id, score):
+    conn = sqlite3.connect('user_scores.db')
+    cursor = conn.cursor()
+
+    # Use INSERT OR REPLACE to update existing user scores
+    cursor.execute('''
+    INSERT INTO user_scores (user_id, score) VALUES (?, ?)
+    ON CONFLICT(user_id) DO UPDATE SET score = score + excluded.score   
+    ''', (user_id, score))
+
+    conn.commit()
+    conn.close()
+
+
+# Function to fetch a user's score
+def get_user_score(user_id):
+    conn = sqlite3.connect('user_scores.db')
+    cursor = conn.cursor()
+
+    cursor.execute('SELECT score FROM user_scores WHERE user_id = ?', (user_id,))
+    result = cursor.fetchone()
+
+    conn.close()
+    return result[0] if result else 0  # Return 0 if the user doesn't exist
+# Function to get the top 10 users with the highest scores
+def get_leaderboard():
+    conn = sqlite3.connect('user_scores.db')
+    cursor = conn.cursor()
+
+    cursor.execute('''
+    SELECT user_id, score FROM user_scores
+    ORDER BY score DESC
+    LIMIT 10
+    ''')
+    leaderboard = cursor.fetchall()  # Fetch all results
+    conn.close()
+
+    return leaderboard
+
+# Function to handle /leaderboard command
+async def leaderboard_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.message.chat.id != GROUP_CHAT_ID:
+        return  # Ignore messages from other chats
+
+    leaderboard = get_leaderboard()
+    if not leaderboard:
+        await retry_after_handling(update.message.reply_text, "No scores available yet.")
+        return
+
+    # Format the leaderboard message
+    leaderboard_text = "🏆 '**Leaderboard**' 🏆\n\n"
+    for idx, (user_id, score) in enumerate(leaderboard, start=1):
+        # Fetch the user info to get the username
+        user = await context.bot.get_chat(user_id)
+        username = user.username if user.username else user.first_name  # Fallback to first name if no username
+
+        user_mention = f'<a href="tg://user?id={user_id}">{username}</a>'
+        leaderboard_text += f"{idx}. {user_mention}: {score:.2f}\n"
+
+    await retry_after_handling(update.message.reply_text, leaderboard_text, parse_mode='HTML')
+
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await retry_after_handling(update.message.reply_text, "Hello! I'm TarsierMood. Share your thoughts, and I'll analyze your mood!")
@@ -154,14 +235,16 @@ async def analyze_sentiment(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.message.from_user.id
     user_message = update.message.text
 
-    score,explanation = await get_sentiment_and_score(user_message)
+    score, explanation = await get_sentiment_and_score(user_message)
 
     logging.info(f"Sentiment score for {user_id}: {score}")
 
-    if user_id not in user_scores:
-        user_scores[user_id] = 0
+    # Update user score in the database
+    update_user_score(user_id, score)
 
-    user_scores[user_id] += score
+    # Retrieve the user's score from the database
+    user_score = get_user_score(user_id)
+
     message_scores.append(score)
     message_count += 1
 
@@ -174,20 +257,26 @@ async def analyze_sentiment(update: Update, context: ContextTypes.DEFAULT_TYPE):
         message_count = 0
         message_scores = []
 
-
-
-
     response = ""
 
     if score < -0.5:
         motivational_quote = await get_ai_quote()
-        response = (f"Hey man, you are too negative.\n{explanation} Your score is now {user_scores[user_id]:.2f}.\n\n "
+        response = (f"Hey man, you are too negative.\n{explanation} Your score is now {user_score:.2f}.\n\n "
                     f"Here's a motivational quote for you:\n{motivational_quote}")
 
-    if user_scores[user_id] < -4:
+    if user_score < -4:
         response += "\nYou've been muted for negativity. Try to be more positive!"
     if response:  # Check if response is not empty before sending
         await retry_after_handling(update.message.reply_text, response)
+
+# Function to check user score
+async def check_score(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.message.chat.id != GROUP_CHAT_ID:
+        return
+
+    user_id = update.message.from_user.id
+    score = get_user_score(user_id)  # Get score from database
+    await retry_after_handling(update.message.reply_text, f"Your current positivity score is: {score:.2f}")
 
 # Function to generate an image with the /meme command
 # Function to generate an image with the /meme command
@@ -213,16 +302,6 @@ async def meme_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # If image generation fails, edit the message to apologize
         await retry_after_handling(message.edit_text, "Sorry, I couldn't generate an image right now.")
 
-
-# Function to check user score
-async def check_score(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.message.chat.id != GROUP_CHAT_ID:
-        return
-
-    user_id = update.message.from_user.id
-    score = user_scores.get(user_id, 0)
-    await retry_after_handling(update.message.reply_text, f"Your current positivity score is: {score:.2f}")
-
 # Function to handle /ask command
 async def ask_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_message = ' '.join(context.args)
@@ -245,6 +324,7 @@ async def ask_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await retry_after_handling(update.message.reply_text, "Sorry, I couldn't get an answer for that.")
 
 async def main():
+    init_db()
     app = ApplicationBuilder().token("8083231744:AAHqYR21xBYEQ838ke1dlRl4WOm3GhV-qkI").build()
 
     app.add_handler(CommandHandler("start", start))
@@ -254,6 +334,7 @@ async def main():
     new_member_handler = MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, welcome_new_member)
     app.add_handler(new_member_handler)
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, analyze_sentiment))
+    app.add_handler(CommandHandler("leaderboard", leaderboard_command))
 
     logging.info("Bot is polling...")
     await app.run_polling()
