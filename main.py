@@ -1,9 +1,10 @@
 import logging
 import asyncio
-import openai
-from telegram import Update, InputMediaPhoto, ChatMember
-from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters, ContextTypes, ChatMemberHandler
+
 import nest_asyncio
+import openai
+from telegram import Update, InputMediaPhoto, ChatMember, ChatPermissions
+from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters, ContextTypes, ChatMemberHandler
 import re
 from telegram.error import RetryAfter
 import sqlite3
@@ -16,76 +17,72 @@ logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s', level=loggi
 
 # Set your OpenAI API key
 
-
-# Initialize a list to track user negativity scores and a list to hold messages for score calculation
+GROUP_CHAT_ID = -1002329036187
 user_scores = {}
 message_scores = []  # Store recent message scores
 message_count = 0  # Count of processed messages
 
-# Replace with your actual group chat ID
-GROUP_CHAT_ID = -1002329036187  # Replace with your group's chat ID
 
-
+#EVERYTHING FOR DATABASE
 def init_db():
-    conn = sqlite3.connect('user_scores.db')  # Connect to the database (creates it if it doesn't exist)
-    cursor = conn.cursor()
-
-    # Create a table to store user scores if it doesn't already exist
-    cursor.execute('''
-    CREATE TABLE IF NOT EXISTS user_scores (
-        user_id INTEGER PRIMARY KEY,
-        score REAL NOT NULL
-    )
-    ''')
-
-    conn.commit()  # Save changes
-    conn.close()
-
-
-# Function to insert or update a user's score
-def update_user_score(user_id, score):
-    conn = sqlite3.connect('user_scores.db')
-    cursor = conn.cursor()
-
-    # Use INSERT OR REPLACE to update existing user scores
-    cursor.execute('''
-    INSERT INTO user_scores (user_id, score) VALUES (?, ?)
-    ON CONFLICT(user_id) DO UPDATE SET score = score + excluded.score   
-    ''', (user_id, score))
-
+    with sqlite3.connect('user_scores.db') as conn:
+        conn.execute('''
+       CREATE TABLE IF NOT EXISTS user_scores (
+           user_id INTEGER PRIMARY KEY,
+           score REAL NOT NULL
+       )
+       ''')
+        conn.execute('''
+                CREATE TABLE IF NOT EXISTS feedback (
+                    user_id INTEGER,
+                    first_name TEXT,
+                    username TEXT,
+                    feedback_message TEXT
+                )
+                ''')
     conn.commit()
-    conn.close()
-
-
-# Function to fetch a user's score
+def update_user_score(user_id, score):
+    with sqlite3.connect('user_scores.db') as conn:
+        conn.execute('''
+        INSERT INTO user_scores (user_id, score) VALUES (?, ?)
+        ON CONFLICT(user_id) DO UPDATE SET score = score + excluded.score   
+        ''', (user_id, score))
+        conn.commit()
 def get_user_score(user_id):
-    conn = sqlite3.connect('user_scores.db')
-    cursor = conn.cursor()
+    with sqlite3.connect('user_scores.db') as conn:
+        result = conn.execute('SELECT score FROM user_scores WHERE user_id = ?', (user_id,)).fetchone()
+    return result[0] if result else 0
 
-    cursor.execute('SELECT score FROM user_scores WHERE user_id = ?', (user_id,))
-    result = cursor.fetchone()
-
-    conn.close()
-    return result[0] if result else 0  # Return 0 if the user doesn't exist
-# Function to get the top 10 users with the highest scores
 def get_leaderboard():
-    conn = sqlite3.connect('user_scores.db')
-    cursor = conn.cursor()
-
-    cursor.execute('''
-    SELECT user_id, score FROM user_scores
-    ORDER BY score DESC
-    LIMIT 10
-    ''')
-    leaderboard = cursor.fetchall()  # Fetch all results
-    conn.close()
-
+    with sqlite3.connect('user_scores.db') as conn:
+        leaderboard = conn.execute('''
+        SELECT user_id, score FROM user_scores
+        ORDER BY score DESC
+        LIMIT 10
+        ''').fetchall()
     return leaderboard
+def store_feedback(user_id, first_name, username, feedback_message):
+    with sqlite3.connect('user_scores.db') as conn:
+        conn.execute('''
+        INSERT INTO feedback (user_id, first_name, username, feedback_message)
+        VALUES (?, ?, ?, ?)
+        ''', (user_id, first_name, username, feedback_message))
+    conn.commit()
+
+
+async def retry_after_handling(func, *args, **kwargs):
+    while True:
+        try:
+            return await func(*args, **kwargs)
+        except RetryAfter as e:
+            delay = e.retry_after
+            logging.warning(f"Flood control exceeded. Retrying in {delay} seconds.")
+            await asyncio.sleep(delay)
 
 # Function to handle /leaderboard command
 async def leaderboard_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.message.chat.id != GROUP_CHAT_ID:
-        return  # Ignore messages from other chats
+        return
 
     leaderboard = get_leaderboard()
     if not leaderboard:
@@ -93,7 +90,7 @@ async def leaderboard_command(update: Update, context: ContextTypes.DEFAULT_TYPE
         return
 
     # Format the leaderboard message
-    leaderboard_text = "🏆 '**Leaderboard**' 🏆\n\n"
+    leaderboard_text = "🏆 <b>**Leaderboard Positivity**</b>🏆\n\n"
     for idx, (user_id, score) in enumerate(leaderboard, start=1):
         # Fetch the user info to get the username
         user = await context.bot.get_chat(user_id)
@@ -103,10 +100,6 @@ async def leaderboard_command(update: Update, context: ContextTypes.DEFAULT_TYPE
         leaderboard_text += f"{idx}. {user_mention}: {score:.2f}\n"
 
     await retry_after_handling(update.message.reply_text, leaderboard_text, parse_mode='HTML')
-
-
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await retry_after_handling(update.message.reply_text, "Hello! I'm TarsierMood. Share your thoughts, and I'll analyze your mood!")
 
 
 async def welcome_new_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -144,26 +137,6 @@ async def welcome_new_member(update: Update, context: ContextTypes.DEFAULT_TYPE)
             "Welcome to the Tarsier Memecoin group! I'm here to analyze your messages and keep the vibe positive. We're glad to have you here."
         )
 
-
-def parse_score(sentiment_analysis):
-    score_match = re.search(r'(-?\d+(?:\.\d+)?)', sentiment_analysis)
-    if score_match:
-        return float(score_match.group(1))
-    else:
-        logging.warning("Failed to parse score; defaulting to neutral")
-        return 0
-
-def get_sentiment_explanation(sentiment_analysis):
-    # Assuming the sentiment_analysis is in the format: "Score: X (Explanation)"
-    try:
-        # Split the string by '(' and ')' to extract the explanation
-        explanation_start = sentiment_analysis.index('[') + 1
-        explanation_end = sentiment_analysis.index(']')
-        explanation = sentiment_analysis[explanation_start:explanation_end].strip()
-        return explanation
-    except ValueError:
-        return "No explanation provided."  # Fallback if parsing fails
-
 async def get_sentiment_and_score(user_message):
     try:
         response = openai.ChatCompletion.create(
@@ -185,42 +158,24 @@ async def get_sentiment_and_score(user_message):
         logging.error(f"Error fetching sentiment score: {e}")
         return 0  # Neutral fallback if API fails
 
-async def get_ai_quote():
-    try:
-        response = openai.ChatCompletion.create(
-            model="gpt-3.5-turbo",
-            messages=[
-                {"role": "system", "content": "You are a motivational coach. Generate a motivational quote for crypto called Tarsier, without hashtags!"}
-            ],
-            max_tokens=50
-        )
-        return response['choices'][0]['message']['content']
-    except Exception as e:
-        logging.error(f"Error fetching quote: {e}")
-        return "Stay positive and keep pushing forward!"
+def parse_score(sentiment_analysis):
+    score_match = re.search(r'(-?\d+(?:\.\d+)?)', sentiment_analysis)
+    if score_match:
+        return float(score_match.group(1))
+    else:
+        logging.warning("Failed to parse score; defaulting to neutral")
+        return 0
 
-async def generate_dalle_image(prompt):
+def get_sentiment_explanation(sentiment_analysis):
+    # Assuming the sentiment_analysis is in the format: "Score: X (Explanation)"
     try:
-        response = openai.Image.create(
-            prompt=prompt,
-            n=1,
-            size="1024x1024"
-        )
-        image_url = response['data'][0]['url']
-        return image_url
-    except Exception as e:
-        logging.error(f"Error generating image: {e}")
-        return None
-
-async def retry_after_handling(func, *args, **kwargs):
-    delay = 1  # initial delay in seconds
-    while True:
-        try:
-            return await func(*args, **kwargs)
-        except RetryAfter as e:
-            delay = e.retry_after
-            logging.warning(f"Flood control exceeded. Retrying in {delay} seconds.")
-            await asyncio.sleep(delay)
+        # Split the string by '(' and ')' to extract the explanation
+        explanation_start = sentiment_analysis.index('[') + 1
+        explanation_end = sentiment_analysis.index(']')
+        explanation = sentiment_analysis[explanation_start:explanation_end].strip()
+        return explanation
+    except ValueError:
+        return "No explanation provided."  # Fallback if parsing fails
 
 async def analyze_sentiment(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global message_count
@@ -262,14 +217,50 @@ async def analyze_sentiment(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if score < -0.5:
         motivational_quote = await get_ai_quote()
         response = (f"Hey man, you are too negative.\n{explanation} Your score is now {user_score:.2f}.\n\n "
-                    f"Here's a motivational quote for you:\n{motivational_quote}")
+                    f"Here's a motivational quote for you:\n<b>{motivational_quote}</b>")
 
     if user_score < -4:
-        response += "\nYou've been muted for negativity. Try to be more positive!"
+        try:
+            await context.bot.restrict_chat_member(
+                chat_id=update.message.chat.id,
+                user_id=user_id,
+                permissions=ChatPermissions(can_send_messages=False)
+            )
+            response += "\n\n🚨<b>You've been muted for negativity. Try to be more positive!</b>🚨"
+        except Exception as e:
+            logging.error(f"Error muting user {user_id}: {e}")
+            response += "\nFailed to mute the user."
     if response:  # Check if response is not empty before sending
-        await retry_after_handling(update.message.reply_text, response)
+        await retry_after_handling(update.message.reply_text, response, parse_mode='html')
 
-# Function to check user score
+async def get_ai_quote():
+    try:
+        response = openai.ChatCompletion.create(
+            model="gpt-3.5-turbo",
+            messages=[
+                {"role": "system", "content": "You are a motivational coach. Generate a motivational quote for crypto called Tarsier, without hashtags!"}
+            ],
+            max_tokens=50
+        )
+        return response['choices'][0]['message']['content']
+    except Exception as e:
+        logging.error(f"Error fetching quote: {e}")
+        return "Stay positive and keep pushing forward!"
+
+async def generate_dalle_image(prompt):
+    try:
+        response = openai.Image.create(
+            prompt=prompt,
+            n=1,
+            size="1024x1024"
+        )
+        image_url = response['data'][0]['url']
+        return image_url
+    except Exception as e:
+        logging.error(f"Error generating image: {e}")
+        return None
+
+# /score
 async def check_score(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.message.chat.id != GROUP_CHAT_ID:
         return
@@ -278,8 +269,7 @@ async def check_score(update: Update, context: ContextTypes.DEFAULT_TYPE):
     score = get_user_score(user_id)  # Get score from database
     await retry_after_handling(update.message.reply_text, f"Your current positivity score is: {score:.2f}")
 
-# Function to generate an image with the /meme command
-# Function to generate an image with the /meme command
+# /meme
 async def meme_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.message.chat.id != GROUP_CHAT_ID:
         return  # Ignore messages from other chats
@@ -302,7 +292,7 @@ async def meme_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # If image generation fails, edit the message to apologize
         await retry_after_handling(message.edit_text, "Sorry, I couldn't generate an image right now.")
 
-# Function to handle /ask command
+# /ask
 async def ask_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_message = ' '.join(context.args)
     if not user_message:
@@ -322,6 +312,22 @@ async def ask_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         logging.error(f"Error fetching answer for question '{user_message}': {e}")
         await retry_after_handling(update.message.reply_text, "Sorry, I couldn't get an answer for that.")
+async def feedback_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.message.from_user.id
+    first_name = update.message.from_user.first_name
+    username = update.message.from_user.username
+    feedback_message = ' '.join(context.args)
+
+    if not feedback_message:
+        await retry_after_handling(update.message.reply_text, "Please provide your feedback after the command.")
+        return
+
+    store_feedback(user_id, first_name, username, feedback_message)
+    await retry_after_handling(update.message.reply_text, "Thank you for your feedback!")
+# /start
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        await retry_after_handling(update.message.reply_text,
+                                   "Hello! I'm TarsierMood. Share your thoughts, and I'll analyze your mood!")
 
 async def main():
     init_db()
@@ -335,6 +341,7 @@ async def main():
     app.add_handler(new_member_handler)
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, analyze_sentiment))
     app.add_handler(CommandHandler("leaderboard", leaderboard_command))
+    app.add_handler(CommandHandler("feedback", feedback_command))
 
     logging.info("Bot is polling...")
     await app.run_polling()
